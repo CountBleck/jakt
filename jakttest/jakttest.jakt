@@ -139,6 +139,9 @@ function print_usage()  {
     eprintln("OPTIONS:")
     eprintln("\t-h\t\tShow this message and exit.")
     eprintln("\t--hide-reasons\t\tHide the reasons why tests that fail do so.")
+    eprintln("\t--interlace\t\tInterlace the failures in the progress output.")
+    eprintln("\t--x-other-bar-pls\t\tUse a simpler progress bar format.")
+    eprintln("\t\t\tWill be printed before and after a test is run.")
     eprintln("\t-j,--jobs <JOBS>\t\tUse JOBS processes. Defaults to the number of available CPUs.")
     eprintln("\t--temp-dir <DIR>\t\tUse DIR as the temporary directory.")
     eprintln("\t\t\tWill try to use $TMP_DIR or /tmp in UNIX-based systems, or %TEMP% in Windows")
@@ -231,11 +234,23 @@ function usize_from_ascii_digits(anon digits: String) -> usize? {
     return value
 }
 
+function indent(anon lines: String, anon indent: String) throws -> String {
+    mut result = ""
+    for line in lines.split('\n').iterator() {
+        result += indent
+        result += line
+        result += "\n"
+    }
+    return result
+}
+
 struct Options {
     files: [String]
     temp_dir: String
     errors: [String]
     show_reasons: bool
+    interlace: bool
+    x_other_bar_pls: bool
     job_count: usize
     help_wanted: bool
 
@@ -246,6 +261,8 @@ struct Options {
                               temp_dir: ""
                               errors
                               show_reasons: true
+                              interlace: false
+                              x_other_bar_pls: false
                               job_count: 0
                               help_wanted: false)
 
@@ -276,6 +293,18 @@ struct Options {
             if args[index] == "--hide-reasons" {
                 index++
                 options.show_reasons = false
+                continue
+            }
+
+            if args[index] == "--interlace" {
+                index++
+                options.interlace = true
+                continue
+            }
+
+            if args[index] == "--x-other-bar-pls" {
+                index++
+                options.x_other_bar_pls = true
                 continue
             }
 
@@ -390,13 +419,56 @@ enum TestFailedReason {
     StdoutUnmatched(had: String, expected: String)
     ErroredAtEarlierStage(failed_stage: String, error: String)
     AbruptExit(i32)
+
+    function stringify(this) throws -> String {
+        mut output = ""
+        match this {
+            CompilerErrorUnmatched(had, expected) => {
+                output += format("Could not find error \"{}\" in error output:\n", expected)
+                output += "Got:\n"
+                output += had
+            }
+            ClangError(error) => {
+                output += "Could not compile generated C++ code into a binary:\n"
+                output += error
+            }
+            StdoutUnmatched(had, expected) => {
+                output += "Could not match test stdout.\n"
+                output += "Expected:\n"
+                output += indent(expected, "    ")
+                output += "\nGot:\n"
+                output += indent(had, "    ")
+            }
+            StderrUnmatched(had, expected) => {
+                output += "Could not match test stderr.\n"
+                output += "Expected:\n    "
+                output += indent(expected, "    ")
+                output += "\nGot:\n    "
+                output += indent(had, "    ")
+            }
+            ErroredAtEarlierStage(failed_stage, error) => {
+                output += "Test failed at an earlier stage than expected.\n"
+                output +=  failed_stage + " failed with output:\n"
+                output += error
+            }
+            AbruptExit(exit_code) => {
+                output += "Test job exited with an unexpected code.\n"
+                output += format("Exit code: {}", exit_code)
+            }
+        }
+        return output
+    }
 }
 
 enum TestExitedResult {
-    Passed
-    Failed(file: String)
+    Passed(file: String)
+    Failed(file: String, reason: TestFailedReason?)
 }
 
+struct PrintOptions {
+    interlace: bool
+    x_other_bar_pls: bool
+}
 
 // A test scheduler that has its process rate limited by
 // the number of directories it has available.
@@ -406,7 +478,9 @@ struct TestScheduler {
     directories: [String]
     passed_count: usize
     failed_count: usize
+    total_test_count: usize
     failed_reasons: [String:TestFailedReason]?
+    print_options: PrintOptions
     // TODO: timeout
 
 
@@ -420,22 +494,26 @@ struct TestScheduler {
 
         // unknown exit code. Assume that the job exited abruptly.
         if not maybe_stage.has_value() {
+            mut reason: TestFailedReason? = None
             if .failed_reasons.has_value() {
-                .failed_reasons![test.file_name] = TestFailedReason::AbruptExit(exit_code)
+                reason = TestFailedReason::AbruptExit(exit_code)
+                .failed_reasons![test.file_name] = reason!
             }
-            return TestExitedResult::Failed(file: test.file_name)
+            return TestExitedResult::Failed(file: test.file_name, reason)
         }
         let stage = maybe_stage!
 
         if stage is CompileCpp {
+            mut reason: TestFailedReason? = None
             if .failed_reasons.has_value() {
                 let path = format("{}/compile_cpp.err",
                     .directories[test.directory_index])
                 mut file = File::open_for_reading(path)
                 let had = bytes_to_string(file.read_all())
-                .failed_reasons![test.file_name] = TestFailedReason::ClangError(had)
+                reason = TestFailedReason::ClangError(had)
+                .failed_reasons![test.file_name] = reason!
             }
-            return TestExitedResult::Failed(file: test.file_name)
+            return TestExitedResult::Failed(file: test.file_name, reason)
         }
 
         // check the exit code before anything
@@ -443,8 +521,8 @@ struct TestScheduler {
 
 
         if not stage.equals(expected_stage) {
+            mut reason: TestFailedReason? = None
             if .failed_reasons.has_value() {
-
                 if not (stage is TranspileJakt) {
                     panic("unreachable: Since clang++ errors and other codes get handled otherwise, only thing that could fail before its expected stage is Jakt to C++.")
                 }
@@ -455,13 +533,12 @@ struct TestScheduler {
                 mut file = File::open_for_reading(file_to_check)
                 let error = bytes_to_string(file.read_all())
 
-                .failed_reasons![test.file_name] = 
-                    TestFailedReason::ErroredAtEarlierStage(
-                        failed_stage: stage.to_string()
-                        error)
-
+                reason = TestFailedReason::ErroredAtEarlierStage(
+                    failed_stage: stage.to_string()
+                    error)
+                .failed_reasons![test.file_name] = reason!
             }
-            return TestExitedResult::Failed(file: test.file_name)
+            return TestExitedResult::Failed(file: test.file_name, reason)
         }
 
         // check the test result
@@ -481,36 +558,45 @@ struct TestScheduler {
         }
 
         if not passed_test {
+            mut reason: TestFailedReason? = None
             if .failed_reasons.has_value() {
-                .failed_reasons![test.file_name] = match test.result.kind {
-                    Okay => 
+                reason = match test.result.kind {
+                    Okay =>
                         TestFailedReason::StdoutUnmatched(
                             had: bytes_to_string(output)
                             expected)
-                    RuntimeError => 
+                    RuntimeError =>
                         TestFailedReason::StderrUnmatched(
                             had: bytes_to_string(output)
                             expected)
-                    CompileError => 
+                    CompileError =>
                         TestFailedReason::CompilerErrorUnmatched(
                             had: bytes_to_string(output)
                             expected)
                 }
+                .failed_reasons![test.file_name] = reason!
             }
-            return TestExitedResult::Failed(file: test.file_name)
+            return TestExitedResult::Failed(file: test.file_name, reason)
         }
-        return TestExitedResult::Passed
+        return TestExitedResult::Passed(file: test.file_name)
     }
 
     function poll_running_tests(mut this) throws {
         mut exited = process::poll_process_exit(pid: -1i32)
         while exited.has_value() {
             match .on_test_exited(pid: exited!.pid(), exit_code: exited!.exit_code()) {
-                Passed => {
+                Passed(file) => {
                     .passed_count++
+                    eprint("\r\x1b[2K[ \x1b[1;36m{}/{}\x1b[m ] Tested {}"
+                            .failed_count + .passed_count
+                            .total_test_count
+                            file)
                 }
-                Failed(file) => {
+                Failed(file, reason) => {
                     eprintln("\r\x1b[2K[ \x1b[31;1mFAIL\x1b[m ] {}", file)
+                    if .print_options.interlace and reason.has_value() {
+                        eprintln(indent(reason!.stringify(), "             "))
+                    }
                     .failed_count++
                 }
             }
@@ -549,7 +635,7 @@ struct TestScheduler {
         return .free_directories.pop()!
     }
 
-    function create(directories: [String], collect_reasons: bool) throws -> TestScheduler {
+    function create(total_test_count: usize, directories: [String], collect_reasons: bool, print_options: PrintOptions) throws -> TestScheduler {
         mut running_tests: [i32:Test] = [:]
         running_tests.ensure_capacity(directories.size())
         mut free_directories: [usize] = []
@@ -568,15 +654,17 @@ struct TestScheduler {
                             free_directories
                             directories
                             passed_count: 0
-                            failed_count: 0
-                            failed_reasons)
+                            failed_count: 0,
+                            total_test_count,
+                            failed_reasons
+                            print_options)
     }
 
-    public function run_tests(mut tests: [Test], directories: [String], collect_reasons: bool) throws -> TestsRunResult {
+    public function run_tests(mut tests: [Test], directories: [String], collect_reasons: bool, print_options: PrintOptions) throws -> TestsRunResult {
         let total_test_count = tests.size()
         // create an empty handler so SIGCHLD is not ignored
         os::ignore_sigchild()
-        mut scheduler = TestScheduler::create(directories, collect_reasons)
+        mut scheduler = TestScheduler::create(total_test_count, directories, collect_reasons, print_options)
         // pre-allocate the command buffer to avoid allocating inside a loop
         let run_once_script = os::get_script_execution_string()
         mut command_buffer: [String] = [run_once_script "" ""]
@@ -589,11 +677,18 @@ struct TestScheduler {
             command_buffer[2] = test.file_name
             let pid = process::start_background_process(args: command_buffer)
             scheduler.running_tests[pid] = test
-            eprint("\r\x1b[2K[ \x1b[1;31m{}\x1b[m/\x1b[1;32m{}\x1b[m/{} ] Testing {}"
+            if print_options.x_other_bar_pls {
+                eprint("\r\x1b[2K[ \x1b[1;36m{}/{}\x1b[m ] Testing {}"
+                        scheduler.failed_count + scheduler.passed_count
+                        scheduler.total_test_count
+                        test.file_name)
+            } else {
+                eprint("\r\x1b[2K[ \x1b[1;31m{}\x1b[m/\x1b[1;32m{}\x1b[m/{} ] Testing {}"
                     scheduler.failed_count
                     scheduler.passed_count
                     total_test_count
                     test.file_name)
+            }
             unsafe { cpp { "fflush(stderr);" }}
         }
 
@@ -658,6 +753,8 @@ function main(args: [String]) {
         }
     }
 
+    eprintln()
+
     // TODO: wrap logic in a TestScheduler class
 
     mut directories: [String] = []
@@ -669,7 +766,8 @@ function main(args: [String]) {
         directories.push(path)
     }
 
-    let run_result = TestScheduler::run_tests(tests, directories, collect_reasons: parsed_options.show_reasons)
+    let print_options = PrintOptions(interlace: parsed_options.interlace, x_other_bar_pls: parsed_options.x_other_bar_pls)
+    let run_result = TestScheduler::run_tests(tests, directories, collect_reasons: parsed_options.show_reasons, print_options)
 
     // delete directories
     for dir in directories.iterator() {
@@ -689,7 +787,7 @@ function main(args: [String]) {
     println("{} skipped", skipped_count)
     println("==============================")
 
-    if run_result.failed_reasons.has_value() and run_result.failed_count > 0 {
+    if not parsed_options.interlace and run_result.failed_reasons.has_value() and run_result.failed_count > 0 {
         eprintln("Showing why tests failed:")
         let reasons = run_result.failed_reasons!
         mut is_first = true
@@ -698,44 +796,7 @@ function main(args: [String]) {
                 eprintln("----------------------------------------")
             }
             eprintln("\x1b[1m{}\x1b[m:", file)
-            mut output = ""
-            match reasons[file] {
-                CompilerErrorUnmatched(had, expected) => {
-                    output += format("Could not find error \"{}\" in error output:\n", expected)
-                    output += had
-                }
-                ClangError(error) => {
-                    output += "Could not compile generated C++ code into a binary:\n"
-                    output += error
-                }
-                StdoutUnmatched(had, expected) => {
-                    output += "Could not match test stdout:\n"
-                    output += "Expected:\n"
-                    output += expected
-                    output += "\nGot:\n"
-                    output += had
-                }
-                StderrUnmatched(had, expected) => {
-                    output += "Could not match test stderr:\n"
-                    output += "Expected:\n"
-                    output += expected
-                    output += "\nGot:"
-                    output += had
-                }
-                ErroredAtEarlierStage(failed_stage, error) => {
-                    output += "Test failed at an earlier stage than expected:\n"
-                    output +=  failed_stage + " failed with output:\n"
-                    output += error
-                }
-                AbruptExit(exit_code) => {
-                    output += "Test job exited with an unexpected code.\n"
-                    output += format("Exit code: {}", exit_code)
-                }
-            }
-
-            for line in output.split('\n').iterator() {
-                eprintln("\x1b[1;0m|\x1b[m\t{}", line)
-            }
+            eprintln(indent(reasons[file].stringify(), "\x1b[1;0m|\x1b[m\t"))
         }
         eprintln("==============================")
     }
